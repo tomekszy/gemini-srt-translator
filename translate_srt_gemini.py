@@ -11,7 +11,9 @@ from google.genai.errors import APIError
 MODELS = [
     "gemini-3.5-flash-lite",
     "gemini-3.8-flash",
+    "gemini-3-flash-preview",
     "gemini-3.6-flash",
+    "gemini-2.5-flash-lite",
 ]
 
 BATCH_SIZE = 25
@@ -27,14 +29,30 @@ SKIP_PHRASES = (
     "www.",
 )
 
-SYSTEM_INSTRUCTION = """Jesteś profesjonalnym tłumaczem napisów filmowych (SRT) z języka angielskiego na język polski dla anime Code Geass: Lelouch of the Rebellion.
+PROMPT_TEMPLATE = """Jesteś profesjonalnym tłumaczem napisów filmowych (SRT) z języka angielskiego na język polski dla filmu: {title}.
 
 Zasady:
 1. Tłumacz naturalnym, żywym językiem polskim dopasowanym do kontekstu i postaci.
-2. Zachowuj nazwy własne ze świata Code Geass (Lelouch, Nunnally, Suzaku, Kururugi, Britannia, Area 11, Knightmare, Knightmare Frame, Geass, Zero, Black Knights, Ashford, Schneizel, Cornelia, Euphemia, C.C., V.V., Rolo, Kallen, Ohgi, Tamaki, Lloyd, Cecile, Jeremiah, Orange, Lancelot, Guren, Burai, Sutherland, Shinkiro, Damocles, F.I.E.I.J.A.). Słowo "Elevens" oddawaj jako "Jedenastki" lub "Eleven" zależnie od kontekstu.
-3. Otrzymasz listę obiektów {"id": int, "text": string}. Zwróć WYŁĄCZNIE poprawny JSON w formacie:
-{"translations": [{"id": 0, "text": "..."}, ...]}
+2. Zachowuj nazwy własne ze świata tego filmu: {proper_nouns}. Dopasowanie nazw własnych jest niewrażliwe na wielkość liter (case-insensitive) – jeśli w tekście źródłowym wystąpi nazwa z tej listy zapisana inną wielkością liter, zachowaj ją w podanej formie.
+3. Otrzymasz listę obiektów {{"id": int, "text": string}}. Zwróć WYŁĄCZNIE poprawny JSON w formacie:
+{{"translations": [{{"id": 0, "text": "..."}}, ...]}}
 Zachowaj dokładnie te same wartości "id" i nie łącz ani nie pomijaj żadnego elementu."""
+
+
+def build_system_instruction(title: str, proper_nouns_raw: str) -> str:
+    clean_title = title.strip() if title.strip() else "nieokreślony tytuł"
+    nouns_list = [n.strip() for n in proper_nouns_raw.split(",") if n.strip()]
+    formatted_nouns = ", ".join(nouns_list) if nouns_list else "brak"
+    return PROMPT_TEMPLATE.format(title=clean_title, proper_nouns=formatted_nouns)
+
+
+def prompt_translation_config() -> tuple[str, str]:
+    print("\n--- Konfiguracja tłumaczenia ---", flush=True)
+    title = input("Jaki film tłumaczymy?: ").strip()
+    proper_nouns = input(
+        "Jakie nazwy własne ze świata tego filmu mają zostać zachowane (po przecinku, case-insensitive)?: "
+    ).strip()
+    return title, proper_nouns
 
 
 def parse_srt_blocks(content: str):
@@ -84,12 +102,23 @@ def parse_id_map(raw_text: str) -> dict[int, str]:
     return mapping
 
 
-def call_gemini_batch(client: genai.Client, lines: list[str], max_attempts: int = 8) -> list[str]:
+def call_gemini_batch(
+    client: genai.Client,
+    system_instruction: str,
+    lines: list[str],
+    max_attempts: int = 40,
+) -> list[str]:
     payload_items = [{"id": idx, "text": txt} for idx, txt in enumerate(lines)]
     payload = json.dumps({"items": payload_items}, ensure_ascii=False)
+    active_models = list(MODELS)
+    model_idx = 0
 
     for attempt in range(1, max_attempts + 1):
-        model = MODELS[(attempt - 1) % len(MODELS)]
+        if not active_models:
+            print("\n[Brak dostępnych modeli] Wszystkie modele zwróciły 404.", flush=True)
+            break
+
+        model = active_models[model_idx % len(active_models)]
         try:
             if REQUEST_DELAY > 0:
                 time.sleep(REQUEST_DELAY)
@@ -98,7 +127,7 @@ def call_gemini_batch(client: genai.Client, lines: list[str], max_attempts: int 
                 model=model,
                 contents=payload,
                 config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM_INSTRUCTION,
+                    system_instruction=system_instruction,
                     temperature=0.2,
                     response_mime_type="application/json",
                 ),
@@ -115,11 +144,20 @@ def call_gemini_batch(client: genai.Client, lines: list[str], max_attempts: int 
             return [id_map[idx] for idx in range(len(lines))]
 
         except APIError as e:
+            if e.code == 404:
+                print(
+                    f"\n[{model} APIError 404] Model niedostępny – usuwam z listy i pomijam oczekiwanie.",
+                    flush=True,
+                )
+                active_models.remove(model)
+                continue
+
             wait_time = 4 if e.code in (429, 503) else min(30, 5 * attempt)
             print(
                 f"\n[{model} APIError {e.code} próba {attempt}/{max_attempts}] -> przełączam/pauza {wait_time}s",
                 flush=True,
             )
+            model_idx += 1
             time.sleep(wait_time)
         except Exception as e:
             wait_time = 3
@@ -127,17 +165,21 @@ def call_gemini_batch(client: genai.Client, lines: list[str], max_attempts: int 
                 f"\n[{model} Błąd paczki próba {attempt}/{max_attempts}] ({e}) -> pauza {wait_time}s",
                 flush=True,
             )
+            model_idx += 1
             time.sleep(wait_time)
 
-    if len(lines) > 1:
+    if len(lines) > 1 and active_models:
         print("\n[Fallback] Rozbijam paczkę na połówki...", flush=True)
         mid = len(lines) // 2
-        return call_gemini_batch(client, lines[:mid], 4) + call_gemini_batch(client, lines[mid:], 4)
+        return (
+            call_gemini_batch(client, system_instruction, lines[:mid], 8)
+            + call_gemini_batch(client, system_instruction, lines[mid:], 8)
+        )
 
     return lines
 
 
-def translate_srt(client: genai.Client, input_path: str):
+def translate_srt(client: genai.Client, system_instruction: str, input_path: str):
     output_path = input_path[:-4] + ".pl.srt" if input_path.endswith(".srt") else input_path + ".pl.srt"
     print(f"\n--- Tłumaczenie: {input_path} -> {output_path} ---", flush=True)
 
@@ -183,7 +225,11 @@ def translate_srt(client: genai.Client, input_path: str):
 
     for start in range(0, len(pending_items), BATCH_SIZE):
         chunk = pending_items[start : start + BATCH_SIZE]
-        translated_texts = call_gemini_batch(client, [item[3] for item in chunk])
+        translated_texts = call_gemini_batch(
+            client,
+            system_instruction,
+            [item[3] for item in chunk],
+        )
 
         for item, tr_text in zip(chunk, translated_texts):
             b_idx, t_idx, has_italics, _ = item
@@ -211,11 +257,18 @@ def main():
         print("Błąd: brak zmiennej środowiskowej GEMINI_API_KEY.", file=sys.stderr)
         sys.exit(1)
 
+    title, proper_nouns = prompt_translation_config()
+    system_instruction = build_system_instruction(title, proper_nouns)
+
     client = genai.Client()
     files = sys.argv[1:] if len(sys.argv) > 1 else [f for f in sorted(glob.glob("*.srt")) if not f.endswith(".pl.srt")]
 
+    if not files:
+        print("Brak plików .srt do przetłumaczenia.")
+        return
+
     for fpath in files:
-        translate_srt(client, fpath)
+        translate_srt(client, system_instruction, fpath)
 
 
 if __name__ == "__main__":
