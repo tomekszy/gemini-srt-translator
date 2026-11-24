@@ -12,9 +12,14 @@ if [[ ! -f "$ROOT_ENV" && -f "$WORK_DIR/.env" ]]; then
   ROOT_ENV="$WORK_DIR/.env"
 fi
 
-# 1. Utwórz .venv, jeśli nie istnieje
-if [[ ! -d "$VENV_DIR" ]]; then
+# 1. Utwórz lub odbuduj .venv, jeśli nie istnieje lub ma nieaktualną ścieżkę po przeniesieniu
+if [[ ! -d "$VENV_DIR" || ! -x "$VENV_DIR/bin/python" ]]; then
   echo "Tworzę środowisko wirtualne w $VENV_DIR..."
+  rm -rf "$VENV_DIR"
+  python3 -m venv "$VENV_DIR"
+elif [[ -f "$VENV_DIR/pyvenv.cfg" ]] && ! grep -qF "$VENV_DIR" "$VENV_DIR/pyvenv.cfg"; then
+  echo "Wykryto przeniesienie katalogu – odbudowuję .venv w $VENV_DIR..."
+  rm -rf "$VENV_DIR"
   python3 -m venv "$VENV_DIR"
 fi
 
@@ -22,11 +27,11 @@ fi
 # shellcheck disable=SC1091
 source "$VENV_DIR/bin/activate"
 
-# 3. Zainstaluj google-genai, jeśli jeszcze nie jest dostępne
-if ! python -c "import google.genai" 2>/dev/null; then
+# 3. Zainstaluj google-genai jawnie wewnątrz .venv
+if ! "$VENV_DIR/bin/python" -c "import google.genai" 2>/dev/null; then
   echo "Instaluję google-genai w .venv..."
-  pip install --upgrade pip >/dev/null
-  pip install google-genai
+  "$VENV_DIR/bin/python" -m pip install --upgrade pip >/dev/null
+  "$VENV_DIR/bin/python" -m pip install google-genai
 fi
 
 # 4. Wyciągnij GEMINI_API_KEY z głównego .env i skopiuj do .venv/.env
