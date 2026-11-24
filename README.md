@@ -1,5 +1,4 @@
 # SRT Subtitle Translator (Gemini API)
-# SRT Subtitle Translator (Gemini API)
 
 Uniwersalne narzędzie CLI do automatycznego tłumaczenia napisów filmowych w formacie `.srt` przy użyciu modeli Google Gemini. Automatycznie wykrywa dostępne modele tekstowe na kluczu API, obsługuje konfigurację z pliku `keywords.json` (tytuł, języki, słownik nazw własnych, pomijane frazy) oraz pozwala wznawiać tłumaczenie od dowolnego numeru napisu.
 
