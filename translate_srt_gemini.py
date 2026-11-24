@@ -18,6 +18,7 @@ MODELS = [
 
 BATCH_SIZE = 25
 REQUEST_DELAY = 2.0
+KEYWORDS_FILENAME = "keywords.json"
 
 SKIP_PHRASES = (
     "yts.mx",
@@ -39,25 +40,89 @@ Zasady:
 Zachowaj dokładnie te same wartości "id" i nie łącz ani nie pomijaj żadnego elementu."""
 
 
-def build_system_instruction(title: str, proper_nouns_raw: str) -> str:
+def build_system_instruction(title: str, keywords: list[str]) -> str:
     clean_title = title.strip() if title.strip() else "nieokreślony tytuł"
-    nouns_list = [n.strip() for n in proper_nouns_raw.split(",") if n.strip()]
-    formatted_nouns = ", ".join(nouns_list) if nouns_list else "brak"
+    clean_keywords = [k.strip() for k in keywords if k.strip()]
+    formatted_nouns = ", ".join(clean_keywords) if clean_keywords else "brak"
     return PROMPT_TEMPLATE.format(title=clean_title, proper_nouns=formatted_nouns)
 
 
-def prompt_translation_config() -> tuple[str, str]:
+def find_keywords_file(input_files: list[str]) -> str | None:
+    candidates = [os.path.join(os.getcwd(), KEYWORDS_FILENAME)]
+    if input_files:
+        first_dir = os.path.dirname(os.path.abspath(input_files[0]))
+        candidates.append(os.path.join(first_dir, KEYWORDS_FILENAME))
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates.append(os.path.join(script_dir, KEYWORDS_FILENAME))
+
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def load_config_from_json(json_path: str) -> tuple[str, list[str]]:
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    title = str(data.get("title", "")).strip()
+    raw_keywords = data.get("keywords", [])
+    if not isinstance(raw_keywords, list):
+        raise ValueError("Pole 'keywords' w keywords.json musi być listą.")
+    keywords = [str(item).strip() for item in raw_keywords if str(item).strip()]
+    return title, keywords
+
+
+def prompt_translation_config(input_files: list[str]) -> tuple[str, list[str], int]:
     print("\n--- Konfiguracja tłumaczenia ---", flush=True)
-    title = input("Jaki film tłumaczymy?: ").strip()
-    proper_nouns = input(
-        "Jakie nazwy własne ze świata tego filmu mają zostać zachowane (po przecinku, case-insensitive)?: "
+
+    json_path = find_keywords_file(input_files)
+    if json_path:
+        try:
+            title, keywords = load_config_from_json(json_path)
+            print(f"Znaleziono plik konfiguracyjny: {json_path}", flush=True)
+            print(f"  Tytuł filmu: {title or '(brak)'}", flush=True)
+            print(
+                f"  Zachowywane nazwy własne ({len(keywords)}): {', '.join(keywords) if keywords else '(brak)'}",
+                flush=True,
+            )
+        except Exception as e:
+            print(f"Błąd odczytu {json_path}: {e}. Przechodzę do trybu ręcznego.", flush=True)
+            json_path = None
+
+    if not json_path:
+        title = input("Jaki film tłumaczymy?: ").strip()
+        proper_nouns_raw = input(
+            "Jakie nazwy własne ze świata tego filmu mają zostać zachowane (po przecinku, case-insensitive)?: "
+        ).strip()
+        keywords = [n.strip() for n in proper_nouns_raw.split(",") if n.strip()]
+
+    start_raw = input(
+        "Od którego numeru napisu (bloku SRT) tłumaczymy plik? [Enter = od początku (0)]: "
     ).strip()
-    return title, proper_nouns
+
+    if not start_raw:
+        start_number = 0
+    else:
+        try:
+            start_number = max(0, int(start_raw))
+        except ValueError:
+            print("Nieprawidłowy numer – rozpoczynam od początku (0).", flush=True)
+            start_number = 0
+
+    return title, keywords, start_number
 
 
-def parse_srt_blocks(content: str):
+def parse_srt_blocks(content: str) -> list[str]:
     normalized = content.replace("\r\n", "\n").replace("\r", "\n").strip()
     return normalized.split("\n\n") if normalized else []
+
+
+def extract_block_number(block: str, fallback_index: int) -> int:
+    first_line = block.split("\n", 1)[0].strip().lstrip("\ufeff")
+    if first_line.isdigit():
+        return int(first_line)
+    return fallback_index + 1
 
 
 def should_skip_line(line: str) -> bool:
@@ -68,21 +133,20 @@ def should_skip_line(line: str) -> bool:
     return any(phrase in lower for phrase in SKIP_PHRASES)
 
 
-def load_existing_progress(output_path: str, total_blocks: int):
+def load_existing_blocks_by_number(output_path: str) -> dict[int, str]:
     if not os.path.exists(output_path):
-        return [None] * total_blocks
+        return {}
 
     with open(output_path, "r", encoding="utf-8", errors="ignore") as f:
         existing_blocks = parse_srt_blocks(f.read())
 
-    result = [None] * total_blocks
+    by_num: dict[int, str] = {}
     for idx, block in enumerate(existing_blocks):
-        if idx >= total_blocks:
-            break
         lines = block.split("\n")
         if len(lines) >= 3 and "-->" in lines[1]:
-            result[idx] = block
-    return result
+            num = extract_block_number(block, idx)
+            by_num[num] = block
+    return by_num
 
 
 def parse_id_map(raw_text: str) -> dict[int, str]:
@@ -179,7 +243,12 @@ def call_gemini_batch(
     return lines
 
 
-def translate_srt(client: genai.Client, system_instruction: str, input_path: str):
+def translate_srt(
+    client: genai.Client,
+    system_instruction: str,
+    input_path: str,
+    start_number: int = 0,
+):
     output_path = input_path[:-4] + ".pl.srt" if input_path.endswith(".srt") else input_path + ".pl.srt"
     print(f"\n--- Tłumaczenie: {input_path} -> {output_path} ---", flush=True)
 
@@ -187,10 +256,26 @@ def translate_srt(client: genai.Client, system_instruction: str, input_path: str
         raw_blocks = parse_srt_blocks(f.read())
 
     total = len(raw_blocks)
-    output_blocks = load_existing_progress(output_path, total)
-    already_done = sum(1 for b in output_blocks if b is not None)
-    if already_done > 0:
-        print(f"Wznowiono: gotowych {already_done}/{total} bloków.", flush=True)
+    output_blocks: list[str | None] = [None] * total
+    existing_by_num = load_existing_blocks_by_number(output_path)
+
+    if start_number > 1:
+        kept_count = 0
+        for i, block in enumerate(raw_blocks):
+            block_num = extract_block_number(block, i)
+            if block_num < start_number:
+                if block_num in existing_by_num:
+                    output_blocks[i] = existing_by_num[block_num]
+                    kept_count += 1
+                else:
+                    output_blocks[i] = block
+        print(
+            f"Zachowano {kept_count} przetłumaczonych bloków sprzed numeru {start_number}. "
+            f"Tłumaczenie startuje od bloku #{start_number}.",
+            flush=True,
+        )
+    else:
+        print("Rozpoczynam tłumaczenie od początku (blok #1).", flush=True)
 
     pending_items = []
     parsed_blocks = []
@@ -218,7 +303,7 @@ def translate_srt(client: genai.Client, system_instruction: str, input_path: str
                 pending_items.append((i, t_idx, has_italics, inner))
 
     if not pending_items:
-        print("Wszystkie bloki są już przetłumaczone.", flush=True)
+        print("Brak linii do przetłumaczenia.", flush=True)
         return
 
     translated_map = {}
@@ -257,18 +342,21 @@ def main():
         print("Błąd: brak zmiennej środowiskowej GEMINI_API_KEY.", file=sys.stderr)
         sys.exit(1)
 
-    title, proper_nouns = prompt_translation_config()
-    system_instruction = build_system_instruction(title, proper_nouns)
-
-    client = genai.Client()
     files = sys.argv[1:] if len(sys.argv) > 1 else [f for f in sorted(glob.glob("*.srt")) if not f.endswith(".pl.srt")]
 
     if not files:
         print("Brak plików .srt do przetłumaczenia.")
         return
 
-    for fpath in files:
-        translate_srt(client, system_instruction, fpath)
+    title, keywords, start_number = prompt_translation_config(files)
+    system_instruction = build_system_instruction(title, keywords)
+
+    client = genai.Client()
+
+    for idx, fpath in enumerate(files):
+        # Numer startowy dotyczy pierwszego pliku; kolejne pliki z listy lecą od zera
+        file_start = start_number if idx == 0 else 0
+        translate_srt(client, system_instruction, fpath, start_number=file_start)
 
 
 if __name__ == "__main__":

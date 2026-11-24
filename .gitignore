@@ -224,3 +224,6 @@ __marimo__/
 
 # SRT files
 *.srt
+
+# Keywords list
+keywords.json
