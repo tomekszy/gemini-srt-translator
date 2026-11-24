@@ -8,6 +8,8 @@ from google import genai
 from google.genai import types
 from google.genai.errors import APIError
 
+PROJECT_URL = "https://github.com/tomekszy/gemini-srt-translator"
+
 BATCH_SIZE = 25
 REQUEST_DELAY = 2.0
 KEYWORDS_FILENAME = "keywords.json"
@@ -79,7 +81,6 @@ def discover_usable_models(client: genai.Client) -> list[str]:
 
         usable.append(short_name)
 
-    # Usuń ewentualne duplikaty i posortuj od najbardziej pojemnych/szybkich
     unique_sorted = sorted(set(usable), key=model_sort_key)
     print(
         f"Wykryto {len(unique_sorted)} obsługiwanych modeli tekstowych: {', '.join(unique_sorted)}",
@@ -168,14 +169,12 @@ def prompt_translation_config(input_files: list[str]) -> tuple[str, list[str], l
             print(f"Błąd odczytu {json_path}: {e}. Brakujące pola zostaną pobrane ręcznie.", flush=True)
             cfg = {}
 
-    # 1. Tytuł
     if "title" in cfg and cfg["title"]:
         title = cfg["title"]
         print(f"  [JSON] Tytuł filmu: {title}", flush=True)
     else:
         title = input("Jaki film tłumaczymy?: ").strip()
 
-    # 2. Język wejściowy i wyjściowy
     if "source_lang" in cfg and cfg["source_lang"]:
         source_lang = cfg["source_lang"]
         print(f"  [JSON] Język wejściowy: {source_lang}", flush=True)
@@ -188,7 +187,6 @@ def prompt_translation_config(input_files: list[str]) -> tuple[str, list[str], l
     else:
         target_lang = input("Na jaki język tłumaczymy napisy?: ").strip()
 
-    # 3. Nazwy własne (keywords)
     if "keywords" in cfg:
         keywords = cfg["keywords"]
         print(
@@ -201,7 +199,6 @@ def prompt_translation_config(input_files: list[str]) -> tuple[str, list[str], l
         ).strip()
         keywords = [n.strip() for n in proper_nouns_raw.split(",") if n.strip()]
 
-    # 4. Frazy pomijane (skip_phrases)
     if "skip_phrases" in cfg:
         skip_phrases = cfg["skip_phrases"]
         print(
@@ -214,7 +211,6 @@ def prompt_translation_config(input_files: list[str]) -> tuple[str, list[str], l
         ).strip()
         skip_phrases = [s.strip().lower() for s in skip_raw.split(",") if s.strip()]
 
-    # 5. Numer startowy bloku SRT
     start_raw = input(
         "Od którego numeru napisu (bloku SRT) tłumaczymy plik? [Enter = od początku (0)]: "
     ).strip()
@@ -243,6 +239,71 @@ def extract_block_number(block: str, fallback_index: int) -> int:
     return fallback_index + 1
 
 
+def is_banner_block(block: str) -> bool:
+    return "Przetłumaczono za pomocą:" in block and PROJECT_URL in block
+
+
+def parse_timestamp_ms(ts: str) -> int:
+    match = re.match(r"(\d{2}):(\d{2}):(\d{2}),(\d{3})", ts.strip())
+    if not match:
+        return 0
+    h, m, s, ms = map(int, match.groups())
+    return ((h * 3600 + m * 60 + s) * 1000) + ms
+
+
+def format_timestamp_ms(total_ms: int) -> str:
+    total_ms = max(0, total_ms)
+    ms = total_ms % 1000
+    total_sec = total_ms // 1000
+    s = total_sec % 60
+    total_min = total_sec // 60
+    m = total_min % 60
+    h = total_min // 60
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def extract_last_end_ms(blocks: list[str]) -> int:
+    last_end = 0
+    for block in blocks:
+        if is_banner_block(block):
+            continue
+        lines = block.split("\n")
+        if len(lines) >= 2 and "-->" in lines[1]:
+            parts = lines[1].split("-->")
+            if len(parts) == 2:
+                end_ms = parse_timestamp_ms(parts[1])
+                if end_ms > last_end:
+                    last_end = end_ms
+    return last_end
+
+
+def build_header_banner() -> str:
+    return (
+        "0\n"
+        "00:00:00,000 --> 00:00:02,000\n"
+        "Przetłumaczono za pomocą: gemini-srt-translator\n"
+        f"{PROJECT_URL}"
+    )
+
+
+def build_footer_banner(blocks: list[str]) -> str:
+    last_end_ms = extract_last_end_ms(blocks)
+    start_ms = last_end_ms + 1000
+    end_ms = start_ms + 4000
+    next_index = len(blocks) + 1
+    return (
+        f"{next_index}\n"
+        f"{format_timestamp_ms(start_ms)} --> {format_timestamp_ms(end_ms)}\n"
+        "Przetłumaczono za pomocą: gemini-srt-translator\n"
+        f"{PROJECT_URL}"
+    )
+
+
+def wrap_with_banners(body_blocks: list[str]) -> list[str]:
+    clean_body = [b for b in body_blocks if not is_banner_block(b)]
+    return [build_header_banner()] + clean_body + [build_footer_banner(clean_body)]
+
+
 def should_skip_line(line: str, skip_phrases: list[str]) -> bool:
     stripped = line.strip()
     if not stripped:
@@ -256,7 +317,7 @@ def load_existing_blocks_by_number(output_path: str) -> dict[int, str]:
         return {}
 
     with open(output_path, "r", encoding="utf-8", errors="ignore") as f:
-        existing_blocks = parse_srt_blocks(f.read())
+        existing_blocks = [b for b in parse_srt_blocks(f.read()) if not is_banner_block(b)]
 
     by_num: dict[int, str] = {}
     for idx, block in enumerate(existing_blocks):
@@ -373,6 +434,12 @@ def build_output_path(input_path: str, target_lang: str) -> str:
     return input_path[:-4] + suffix if input_path.endswith(".srt") else input_path + suffix
 
 
+def write_srt_file(output_path: str, body_blocks: list[str]) -> None:
+    final_blocks = wrap_with_banners(body_blocks)
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write("\n\n".join(final_blocks) + "\n")
+
+
 def translate_srt(
     client: genai.Client,
     system_instruction: str,
@@ -386,7 +453,7 @@ def translate_srt(
     print(f"\n--- Tłumaczenie: {input_path} -> {output_path} ---", flush=True)
 
     with open(input_path, "r", encoding="utf-8", errors="ignore") as f:
-        raw_blocks = parse_srt_blocks(f.read())
+        raw_blocks = [b for b in parse_srt_blocks(f.read()) if not is_banner_block(b)]
 
     total = len(raw_blocks)
     output_blocks: list[str | None] = [None] * total
@@ -435,6 +502,9 @@ def translate_srt(
                 inner = stripped[3:-4] if has_italics else stripped
                 pending_items.append((i, t_idx, has_italics, inner))
 
+    materialized = [b if b is not None else raw_blocks[idx] for idx, b in enumerate(output_blocks)]
+    write_srt_file(output_path, materialized)
+
     if not pending_items:
         print("Brak linii do przetłumaczenia.", flush=True)
         return
@@ -463,8 +533,7 @@ def translate_srt(
             output_blocks[b_idx] = "\n".join([index_line, time_line] + new_text_lines)
 
         materialized = [b if b is not None else raw_blocks[idx] for idx, b in enumerate(output_blocks)]
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write("\n\n".join(materialized) + "\n")
+        write_srt_file(output_path, materialized)
 
         print(f"Postęp linii: {min(start + BATCH_SIZE, len(pending_items))}/{len(pending_items)}", flush=True)
 
