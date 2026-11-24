@@ -44,11 +44,13 @@ Narzędzie CLI do automatycznego tłumaczenia napisów filmowych w formacie `.sr
 
 ```env
 GEMINI_API_KEY=twoj_klucz_api_z_google_ai_studio
+```
 
 ## Instrukcja użytkowania
 
 1. **Nadanie uprawnień skryptowi startowemu (jednorazowo)**:
    `chmod +x run_translate.sh`
+
 2. **Tłumaczenie konkretnego pliku .srt**:
    `./run_translate.sh Nazwa.Filmu.2018.1080p.srt`
    Wynik zostanie zapisany jako Nazwa.Filmu.2018.1080p.pl.srt.
@@ -59,9 +61,6 @@ GEMINI_API_KEY=twoj_klucz_api_z_google_ai_studio
 
 4. **Kontynuowanie tłumaczenia przerwanego pliku**:
    Jeśli plik Film.pl.srt jest przetłumaczony np. do napisu nr 421, a od 422 zaczyna się tekst oryginalny:
-
    Uruchom `./run_translate.sh Film.srt.`
-
    Na pytanie Od którego numeru napisu (bloku SRT) tłumaczymy plik? wpisz 422 i zatwierdź klawiszem Enter.
-
    Bloki 1..421 pozostaną nienaruszone, a program dokończy tłumaczenie od 422 wzwyż.
