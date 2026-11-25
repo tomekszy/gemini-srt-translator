@@ -12,7 +12,18 @@ PROJECT_URL = "https://github.com/tomekszy/gemini-srt-translator"
 
 BATCH_SIZE = 25
 REQUEST_DELAY = 2.0
-KEYWORDS_FILENAME = "keywords.json"
+
+DEFAULT_TARGET_LANG = "polski"
+
+SKIP_PHRASES = [
+    "yts.mx",
+    "yify",
+    "subtitles by",
+    "downloaded from",
+    "official yify",
+    "sync and corrected",
+    "www.",
+]
 
 EXCLUDED_MODEL_SUBSTRINGS = (
     "embedding",
@@ -28,11 +39,30 @@ EXCLUDED_MODEL_SUBSTRINGS = (
     "aqa",
 )
 
-PROMPT_TEMPLATE = """Jesteś profesjonalnym tłumaczem napisów filmowych (SRT) tłumaczącym z języka: {source_lang} na język: {target_lang} dla filmu: {title}.
+IDENTIFY_PROMPT_TEMPLATE = """Na podstawie nazwy pliku z napisami SRT rozpoznaj tytuł filmu, serialu lub anime, sprawdź czy taki tytuł istnieje i wygeneruj listę nazw własnych (imiona, nazwiska, nazwy miejsc, frakcji, maszyn, pojęć charakterystycznych), których nie należy tłumaczyć na język docelowy.
+
+Wejście:
+- Nazwa pliku: {filename}
+- Wskazówka / poprawiony tytuł od użytkownika: {title_hint}
+
+Zwróć WYŁĄCZNIE poprawny JSON w formacie:
+{{
+  "exists": true,
+  "title": "Pełny, właściwy tytuł produkcji",
+  "keywords": ["Nazwa1", "Nazwa2"]
+}}
 
 Zasady:
-1. Tłumacz naturalnym, żywym językiem docelowym ({target_lang}), dopasowanym do kontekstu i postaci.
-2. Zachowuj nazwy własne ze świata tego filmu: {proper_nouns}. Dopasowanie nazw własnych jest niewrażliwe na wielkość liter (case-insensitive) – jeśli w tekście źródłowym wystąpi nazwa z tej listy zapisana inną wielkością liter, zachowaj ją w podanej formie.
+1. Jeśli nazwa pliku zawiera tagi wydania (np. 1080p, BluRay, x264, AAC, YTS.MX), odrzuć je przy ustalaniu tytułu.
+2. Jeśli podano wskazówkę/poprawiony tytuł, oprzyj się na nim i zweryfikuj go.
+3. "exists" ustaw na true, jeśli rozpoznany tytuł istnieje w znanych produkcjach (film/serial/anime), lub false, jeśli to niepewne/nieznane.
+4. "keywords" powinno zawierać unikalne nazwy własne ze świata tego tytułu bez duplikatów."""
+
+TRANSLATE_PROMPT_TEMPLATE = """Jesteś profesjonalnym tłumaczem napisów filmowych (SRT) tłumaczącym z wykrytego języka źródłowego na język: {target_lang} dla produkcji: {title}.
+
+Zasady:
+1. Automatycznie wykrywaj język źródłowy każdej kwestii i tłumacz naturalnym, żywym językiem docelowym ({target_lang}), dopasowanym do kontekstu i postaci.
+2. Zachowuj nazwy własne ze świata tego tytułu: {proper_nouns}. Dopasowanie nazw własnych jest niewrażliwe na wielkość liter (case-insensitive) – jeśli w tekście źródłowym wystąpi nazwa z tej listy zapisana inną wielkością liter, zachowaj ją w podanej formie.
 3. Otrzymasz listę obiektów {{"id": int, "text": string}}. Zwróć WYŁĄCZNIE poprawny JSON w formacie:
 {{"translations": [{{"id": 0, "text": "..."}}, ...]}}
 Zachowaj dokładnie te same wartości "id" i nie łącz ani nie pomijaj żadnego elementu."""
@@ -89,127 +119,169 @@ def discover_usable_models(client: genai.Client) -> list[str]:
     return unique_sorted
 
 
-def build_system_instruction(
-    title: str,
-    keywords: list[str],
-    source_lang: str,
-    target_lang: str,
+def strip_code_fences(raw_text: str) -> str:
+    cleaned = raw_text.strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    return cleaned
+
+
+def call_gemini_raw(
+    client: genai.Client,
+    system_instruction: str,
+    prompt_content: str,
+    active_models: list[str],
+    max_attempts: int = 40,
 ) -> str:
-    clean_title = title.strip() if title.strip() else "nieokreślony tytuł"
-    clean_source = source_lang.strip() if source_lang.strip() else "angielski"
-    clean_target = target_lang.strip() if target_lang.strip() else "polski"
-    clean_keywords = [k.strip() for k in keywords if k.strip()]
-    formatted_nouns = ", ".join(clean_keywords) if clean_keywords else "brak"
+    model_idx = 0
 
-    return PROMPT_TEMPLATE.format(
-        title=clean_title,
-        proper_nouns=formatted_nouns,
-        source_lang=clean_source,
-        target_lang=clean_target,
+    for attempt in range(1, max_attempts + 1):
+        if not active_models:
+            raise RuntimeError("Brak dostępnych modeli – wszystkie zostały wykluczone.")
+
+        model = active_models[model_idx % len(active_models)]
+        try:
+            if REQUEST_DELAY > 0:
+                time.sleep(REQUEST_DELAY)
+
+            response = client.models.generate_content(
+                model=model,
+                contents=prompt_content,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    temperature=0.2,
+                    response_mime_type="application/json",
+                ),
+            )
+
+            if not response.text:
+                raise ValueError("Pusta odpowiedź z API")
+
+            return response.text
+
+        except APIError as e:
+            if e.code == 404:
+                print(
+                    f"\n[{model} APIError 404] Model niedostępny – usuwam z listy i pomijam oczekiwanie.",
+                    flush=True,
+                )
+                active_models.remove(model)
+                continue
+
+            wait_time = 4 if e.code in (429, 503) else min(30, 5 * attempt)
+            print(
+                f"\n[{model} APIError {e.code} próba {attempt}/{max_attempts}] -> przełączam/pauza {wait_time}s",
+                flush=True,
+            )
+            model_idx += 1
+            time.sleep(wait_time)
+        except Exception as e:
+            wait_time = 3
+            print(
+                f"\n[{model} Błąd zapytania próba {attempt}/{max_attempts}] ({e}) -> pauza {wait_time}s",
+                flush=True,
+            )
+            model_idx += 1
+            time.sleep(wait_time)
+
+    raise RuntimeError("Nie udało się uzyskać odpowiedzi po wyczerpaniu prób.")
+
+
+def infer_title_and_keywords(
+    client: genai.Client,
+    active_models: list[str],
+    filename: str,
+    override_title: str | None = None,
+) -> tuple[bool, str, list[str]]:
+    prompt = IDENTIFY_PROMPT_TEMPLATE.format(
+        filename=os.path.basename(filename),
+        title_hint=override_title if override_title else "(brak – odczytaj z nazwy pliku)",
     )
+    raw = call_gemini_raw(
+        client=client,
+        system_instruction="Jesteś asystentem rozpoznającym tytuły filmów i seriali oraz ich nazwy własne. Zwracaj wyłącznie poprawny JSON.",
+        prompt_content=prompt,
+        active_models=active_models,
+        max_attempts=15,
+    )
+    data = json.loads(strip_code_fences(raw))
+    exists = bool(data.get("exists", False))
+    title = str(data.get("title", "")).strip() or os.path.basename(filename)
+    raw_keywords = data.get("keywords", [])
+    keywords: list[str] = []
+    seen = set()
+    if isinstance(raw_keywords, list):
+        for kw in raw_keywords:
+            item = str(kw).strip()
+            if item and item.lower() not in seen:
+                seen.add(item.lower())
+                keywords.append(item)
+    return exists, title, keywords
 
 
-def find_keywords_file(input_files: list[str]) -> str | None:
-    candidates = [os.path.join(os.getcwd(), KEYWORDS_FILENAME)]
-    if input_files:
-        first_dir = os.path.dirname(os.path.abspath(input_files[0]))
-        candidates.append(os.path.join(first_dir, KEYWORDS_FILENAME))
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    candidates.append(os.path.join(script_dir, KEYWORDS_FILENAME))
+def edit_keywords_interactive(initial_keywords: list[str]) -> list[str]:
+    keywords = list(initial_keywords)
+    while True:
+        print(
+            f"\nLista słów kluczowych ({len(keywords)}): "
+            f"{', '.join(keywords) if keywords else '(brak)'}",
+            flush=True,
+        )
+        action = input(
+            "Zatwierdź Enterem, wpisz '+nazwa' (lub 'nazwa') aby dodać, albo '-nazwa' aby usunąć: "
+        ).strip()
 
-    for path in candidates:
-        if os.path.isfile(path):
-            return path
-    return None
+        if not action:
+            return keywords
 
-
-def parse_string_list(raw_value, field_name: str) -> list[str]:
-    if not isinstance(raw_value, list):
-        raise ValueError(f"Pole '{field_name}' w {KEYWORDS_FILENAME} musi być listą.")
-    return [str(item).strip() for item in raw_value if str(item).strip()]
-
-
-def load_config_from_json(json_path: str) -> dict:
-    with open(json_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    if not isinstance(data, dict):
-        raise ValueError("Plik konfiguracyjny JSON musi zawierać obiekt główny.")
-
-    config: dict = {}
-
-    if "title" in data and data["title"] is not None:
-        config["title"] = str(data["title"]).strip()
-
-    if "keywords" in data and data["keywords"] is not None:
-        config["keywords"] = parse_string_list(data["keywords"], "keywords")
-
-    if "skip_phrases" in data and data["skip_phrases"] is not None:
-        config["skip_phrases"] = [s.lower() for s in parse_string_list(data["skip_phrases"], "skip_phrases")]
-
-    if "source_lang" in data and data["source_lang"] is not None:
-        config["source_lang"] = str(data["source_lang"]).strip()
-
-    if "target_lang" in data and data["target_lang"] is not None:
-        config["target_lang"] = str(data["target_lang"]).strip()
-
-    return config
+        if action.startswith("-"):
+            target = action[1:].strip().lower()
+            before = len(keywords)
+            keywords = [k for k in keywords if k.lower() != target]
+            if len(keywords) == before:
+                print(f"Nie znaleziono słowa kluczowego: '{action[1:].strip()}'", flush=True)
+        elif action.startswith("+"):
+            added = action[1:].strip()
+            if added and added.lower() not in {k.lower() for k in keywords}:
+                keywords.append(added)
+        else:
+            if action.lower() not in {k.lower() for k in keywords}:
+                keywords.append(action)
 
 
-def prompt_translation_config(input_files: list[str]) -> tuple[str, list[str], list[str], str, str, int]:
+def prompt_translation_config(
+    client: genai.Client,
+    active_models: list[str],
+    sample_file: str,
+) -> tuple[str, list[str], str, int]:
     print("\n--- Konfiguracja tłumaczenia ---", flush=True)
 
-    cfg: dict = {}
-    json_path = find_keywords_file(input_files)
-    if json_path:
-        try:
-            cfg = load_config_from_json(json_path)
-            print(f"Znaleziono plik konfiguracyjny: {json_path}", flush=True)
-        except Exception as e:
-            print(f"Błąd odczytu {json_path}: {e}. Brakujące pola zostaną pobrane ręcznie.", flush=True)
-            cfg = {}
-
-    if "title" in cfg and cfg["title"]:
-        title = cfg["title"]
-        print(f"  [JSON] Tytuł filmu: {title}", flush=True)
-    else:
-        title = input("Jaki film tłumaczymy?: ").strip()
-
-    if "source_lang" in cfg and cfg["source_lang"]:
-        source_lang = cfg["source_lang"]
-        print(f"  [JSON] Język wejściowy: {source_lang}", flush=True)
-    else:
-        source_lang = input("Jaki jest język wejściowy napisów?: ").strip()
-
-    if "target_lang" in cfg and cfg["target_lang"]:
-        target_lang = cfg["target_lang"]
-        print(f"  [JSON] Język wyjściowy: {target_lang}", flush=True)
-    else:
-        target_lang = input("Na jaki język tłumaczymy napisy?: ").strip()
-
-    if "keywords" in cfg:
-        keywords = cfg["keywords"]
-        print(
-            f"  [JSON] Zachowywane nazwy własne ({len(keywords)}): {', '.join(keywords) if keywords else '(brak)'}",
-            flush=True,
+    override_title: str | None = None
+    while True:
+        print(f"Analizuję nazwę pliku: {os.path.basename(sample_file)}...", flush=True)
+        exists, title, keywords = infer_title_and_keywords(
+            client=client,
+            active_models=active_models,
+            filename=sample_file,
+            override_title=override_title,
         )
-    else:
-        proper_nouns_raw = input(
-            "Jakie nazwy własne ze świata tego filmu mają zostać zachowane (po przecinku, case-insensitive)?: "
-        ).strip()
-        keywords = [n.strip() for n in proper_nouns_raw.split(",") if n.strip()]
+        print(f"\nRozpoznany tytuł: {title}", flush=True)
+        print(f"Czy taki tytuł istnieje w bazie wiedzy modelu?: {'TAK' if exists else 'NIE / NIEPEWNE'}", flush=True)
+        print(f"Wygenerowane słowa kluczowe: {', '.join(keywords) if keywords else '(brak)'}", flush=True)
+        print(f"Pomijane frazy napisowe: {', '.join(SKIP_PHRASES)}", flush=True)
 
-    if "skip_phrases" in cfg:
-        skip_phrases = cfg["skip_phrases"]
-        print(
-            f"  [JSON] Pomijane frazy ({len(skip_phrases)}): {', '.join(skip_phrases) if skip_phrases else '(brak)'}",
-            flush=True,
-        )
-    else:
-        skip_raw = input(
-            "Jakie frazy/stopki mają być pomijane przy tłumaczeniu (po przecinku, Enter = brak)?: "
+        decision = input(
+            "Potwierdź tytuł Enterem lub wpisz poprawny tytuł, aby odpytać Gemini ponownie: "
         ).strip()
-        skip_phrases = [s.strip().lower() for s in skip_raw.split(",") if s.strip()]
+
+        if not decision:
+            break
+        override_title = decision
+
+    keywords = edit_keywords_interactive(keywords)
+
+    target_lang_raw = input(f"\nNa jaki język tłumaczymy napisy? [{DEFAULT_TARGET_LANG}]: ").strip()
+    target_lang = target_lang_raw if target_lang_raw else DEFAULT_TARGET_LANG
 
     start_raw = input(
         "Od którego numeru napisu (bloku SRT) tłumaczymy plik? [Enter = od początku (0)]: "
@@ -224,7 +296,20 @@ def prompt_translation_config(input_files: list[str]) -> tuple[str, list[str], l
             print("Nieprawidłowy numer – rozpoczynam od początku (0).", flush=True)
             start_number = 0
 
-    return title, keywords, skip_phrases, source_lang, target_lang, start_number
+    return title, keywords, target_lang, start_number
+
+
+def build_system_instruction(title: str, keywords: list[str], target_lang: str) -> str:
+    clean_title = title.strip() if title.strip() else "nieokreślony tytuł"
+    clean_target = target_lang.strip() if target_lang.strip() else DEFAULT_TARGET_LANG
+    clean_keywords = [k.strip() for k in keywords if k.strip()]
+    formatted_nouns = ", ".join(clean_keywords) if clean_keywords else "brak"
+
+    return TRANSLATE_PROMPT_TEMPLATE.format(
+        title=clean_title,
+        proper_nouns=formatted_nouns,
+        target_lang=clean_target,
+    )
 
 
 def parse_srt_blocks(content: str) -> list[str]:
@@ -304,12 +389,12 @@ def wrap_with_banners(body_blocks: list[str]) -> list[str]:
     return [build_header_banner()] + clean_body + [build_footer_banner(clean_body)]
 
 
-def should_skip_line(line: str, skip_phrases: list[str]) -> bool:
+def should_skip_line(line: str) -> bool:
     stripped = line.strip()
     if not stripped:
         return True
     lower = stripped.lower()
-    return any(phrase in lower for phrase in skip_phrases)
+    return any(phrase in lower for phrase in SKIP_PHRASES)
 
 
 def load_existing_blocks_by_number(output_path: str) -> dict[int, str]:
@@ -329,11 +414,7 @@ def load_existing_blocks_by_number(output_path: str) -> dict[int, str]:
 
 
 def parse_id_map(raw_text: str) -> dict[int, str]:
-    cleaned = raw_text.strip()
-    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
-    cleaned = re.sub(r"\s*```$", "", cleaned)
-    data = json.loads(cleaned)
-
+    data = json.loads(strip_code_fences(raw_text))
     items = data.get("translations") if isinstance(data, dict) else data
     if not isinstance(items, list):
         raise ValueError("Brak listy 'translations' w odpowiedzi")
@@ -444,7 +525,6 @@ def translate_srt(
     client: genai.Client,
     system_instruction: str,
     active_models: list[str],
-    skip_phrases: list[str],
     target_lang: str,
     input_path: str,
     start_number: int = 0,
@@ -496,7 +576,7 @@ def translate_srt(
         if output_blocks[i] is None:
             for t_idx, line in enumerate(text_lines):
                 stripped = line.strip()
-                if should_skip_line(stripped, skip_phrases):
+                if should_skip_line(stripped):
                     continue
                 has_italics = stripped.startswith("<i>") and stripped.endswith("</i>") and len(stripped) > 7
                 inner = stripped[3:-4] if has_italics else stripped
@@ -557,18 +637,21 @@ def main():
         print("Błąd: nie znaleziono żadnych obsługiwanych modeli Gemini na tym kluczu API.", file=sys.stderr)
         sys.exit(1)
 
-    title, keywords, skip_phrases, source_lang, target_lang, start_number = prompt_translation_config(files)
-    system_instruction = build_system_instruction(title, keywords, source_lang, target_lang)
+    title, keywords, target_lang, start_number = prompt_translation_config(
+        client=client,
+        active_models=active_models,
+        sample_file=files[0],
+    )
+    system_instruction = build_system_instruction(title, keywords, target_lang)
 
     for idx, fpath in enumerate(files):
         file_start = start_number if idx == 0 else 0
         translate_srt(
-            client,
-            system_instruction,
-            active_models,
-            skip_phrases,
-            target_lang,
-            fpath,
+            client=client,
+            system_instruction=system_instruction,
+            active_models=active_models,
+            target_lang=target_lang,
+            input_path=fpath,
             start_number=file_start,
         )
 
