@@ -50,6 +50,7 @@ const EXCLUDED_MODEL_SUBSTRINGS: readonly string[] = [
     "robotics",
     "deep-research",
     "aqa",
+    "image"
 ];
 
 const IDENTIFY_PROMPT_TEMPLATE = `Na podstawie nazwy pliku z napisami SRT rozpoznaj tytuł filmu, serialu lub anime, sprawdź czy taki tytuł istnieje i wygeneruj listę nazw własnych (imiona, nazwiska, nazwy miejsc, frakcji, maszyn, pojęć charakterystycznych), których nie należy tłumaczyć na język docelowy.
@@ -341,7 +342,7 @@ async function callGeminiRaw(
             const status = getErrorStatusCode(err);
             if (status === 404) {
                 console.log(
-                    `\n[${model} APIError 404] Model niedostępny – usuwam z listy i pomijam oczekiwanie.`
+                    `\n[${model}] błąd 404 (model niedostępny) – usuwam z listy i pomijam oczekiwanie.`
                 );
                 activeModels.splice(activeModels.indexOf(model), 1);
                 continue;
@@ -349,9 +350,9 @@ async function callGeminiRaw(
 
             const waitSec =
                 status === 429 || status === 503 ? 4 : Math.min(30, 5 * attempt);
-            const errMsg = err instanceof Error ? err.message : String(err);
+            const shortErr = formatShortError(err, status);
             console.log(
-                `\n[${model} Błąd próba ${attempt}/${maxAttempts}] (${errMsg}) -> przełączam/pauza ${waitSec}s`
+                `\n[${model}] ${shortErr}, próba ${attempt}/${maxAttempts} -> przełączam/pauza ${waitSec}s`
             );
             modelIdx++;
             await sleep(waitSec * 1000);
@@ -768,7 +769,7 @@ async function callGeminiBatch(
             const status = getErrorStatusCode(err);
             if (status === 404) {
                 console.log(
-                    `\n[${model} APIError 404] Model niedostępny – usuwam z listy i pomijam oczekiwanie.`
+                    `\n[${model}] błąd 404 (model niedostępny) – usuwam z listy i pomijam oczekiwanie.`
                 );
                 activeModels.splice(activeModels.indexOf(model), 1);
                 continue;
@@ -776,9 +777,9 @@ async function callGeminiBatch(
 
             const waitSec =
                 status === 429 || status === 503 ? 4 : Math.min(30, 5 * attempt);
-            const errMsg = err instanceof Error ? err.message : String(err);
+            const shortErr = formatShortError(err, status);
             console.log(
-                `\n[${model} Błąd paczki próba ${attempt}/${maxAttempts}] (${errMsg}) -> przełączam/pauza ${waitSec}s`
+                `\n[${model}] ${shortErr}, próba ${attempt}/${maxAttempts} -> przełączam/pauza ${waitSec}s`
             );
             modelIdx++;
             await sleep(waitSec * 1000);
@@ -975,6 +976,18 @@ function findSrtFilesInCwd(): string[] {
         )
         .map((e) => e.name)
         .sort((a, b) => a.localeCompare(b));
+}
+
+function formatShortError(err: unknown, status?: number): string {
+    if (status !== undefined) {
+        return `błąd ${status}`;
+    }
+    if (err instanceof Error) {
+        const firstLine = err.message.split("\n")[0].trim();
+        return firstLine.length > 120 ? `${firstLine.slice(0, 117)}...` : firstLine;
+    }
+    const str = String(err).split("\n")[0].trim();
+    return str.length > 120 ? `${str.slice(0, 117)}...` : str;
 }
 
 async function main(): Promise<void> {
