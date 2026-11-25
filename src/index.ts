@@ -12,6 +12,22 @@ const BATCH_SIZE = 25;
 const REQUEST_DELAY_MS = 2000;
 const DEFAULT_TARGET_LANG = "polski";
 
+const LANG_CODE_NAMES: Record<string, string> = {
+    en: "angielski",
+    pl: "polski",
+    de: "niemiecki",
+    ja: "japoński",
+    jp: "japoński",
+    es: "hiszpański",
+    fr: "francuski",
+    it: "włoski",
+    ru: "rosyjski",
+    uk: "ukraiński",
+    pt: "portugalski",
+    ko: "koreański",
+    zh: "chiński",
+};
+
 const SKIP_PHRASES: readonly string[] = [
     "yts.mx",
     "yify",
@@ -50,19 +66,27 @@ Zwróć WYŁĄCZNIE poprawny JSON w formacie:
 }
 
 Zasady:
-1. Jeśli nazwa pliku zawiera tagi wydania (np. 1080p, BluRay, x264, AAC, YTS.MX), odrzuć je przy ustalaniu tytułu.
+1. Jeśli nazwa pliku zawiera tagi wydania (np. 1080p, BluRay, x264, AAC, YTS.MX) lub kody języka (np. .en.srt), odrzuć je przy ustalaniu tytułu.
 2. Jeśli podano wskazówkę/poprawiony tytuł, oprzyj się na nim i zweryfikuj go.
 3. "exists" ustaw na true, jeśli rozpoznany tytuł istnieje w znanych produkcjach (film/serial/anime), lub false, jeśli to niepewne/nieznane.
 4. "keywords" powinno zawierać unikalne nazwy własne ze świata tego tytułu bez duplikatów.`;
 
-const TRANSLATE_PROMPT_TEMPLATE = `Jesteś profesjonalnym tłumaczem napisów filmowych (SRT) tłumaczącym z wykrytego języka źródłowego na język: {target_lang} dla produkcji: {title}.
+const TRANSLATE_PROMPT_TEMPLATE = `Jesteś profesjonalnym tłumaczem napisów filmowych (SRT) tłumaczącym z języka źródłowego ({source_lang}) na język docelowy ({target_lang}) dla produkcji: {title}.
 
 Zasady:
-1. Automatycznie wykrywaj język źródłowy każdej kwestii i tłumacz naturalnym, żywym językiem docelowym ({target_lang}), dopasowanym do kontekstu i postaci.
+1. Tłumacz naturalnym, żywym językiem docelowym ({target_lang}), dopasowanym do kontekstu i postaci (w razie niejasności wspieraj się automatycznym wykryciem języka z treści napisów).
 2. Zachowuj nazwy własne ze świata tego tytułu: {proper_nouns}. Dopasowanie nazw własnych jest niewrażliwe na wielkość liter (case-insensitive) – jeśli w tekście źródłowym wystąpi nazwa z tej listy zapisana inną wielkością liter, zachowaj ją w podanej formie.
 3. Otrzymasz listę obiektów {"id": int, "text": string}. Zwróć WYŁĄCZNIE poprawny JSON w formacie:
 {"translations": [{"id": 0, "text": "..."}, ...]}
 Zachowaj dokładnie te same wartości "id" i nie łącz ani nie pomijaj żadnego elementu.`;
+
+interface CliOptions {
+    files: string[];
+    startNumber?: number;
+    targetLang?: string;
+    titleHint?: string;
+    autoYes: boolean;
+}
 
 interface TranslationItem {
     id: number;
@@ -86,6 +110,99 @@ interface ParsedSrtBlock {
     indexLine: string | null;
     timeLine: string | null;
     textLines: string[];
+}
+
+function parseCliArgs(argv: string[]): CliOptions {
+    const files: string[] = [];
+    let startNumber: number | undefined;
+    let targetLang: string | undefined;
+    let titleHint: string | undefined;
+    let autoYes = false;
+
+    for (let i = 0; i < argv.length; i++) {
+        const arg = argv[i];
+
+        if (arg === "--yes" || arg === "-y") {
+            autoYes = true;
+            continue;
+        }
+
+        if (arg === "--start" || arg === "-s") {
+            const val = argv[++i];
+            if (!val || Number.isNaN(Number.parseInt(val, 10)) || Number.parseInt(val, 10) < 0) {
+                throw new Error(`Nieprawidłowa wartość dla ${arg}: '${val ?? ""}'`);
+            }
+            startNumber = Number.parseInt(val, 10);
+            continue;
+        }
+
+        if (arg.startsWith("--start=")) {
+            const val = arg.slice("--start=".length);
+            if (!val || Number.isNaN(Number.parseInt(val, 10)) || Number.parseInt(val, 10) < 0) {
+                throw new Error(`Nieprawidłowa wartość dla --start: '${val}'`);
+            }
+            startNumber = Number.parseInt(val, 10);
+            continue;
+        }
+
+        if (arg === "--lang" || arg === "-l") {
+            const val = argv[++i];
+            if (!val || !val.trim()) {
+                throw new Error(`Brak wartości dla ${arg}`);
+            }
+            targetLang = val.trim();
+            continue;
+        }
+
+        if (arg.startsWith("--lang=")) {
+            const val = arg.slice("--lang=".length).trim();
+            if (!val) {
+                throw new Error("Brak wartości dla --lang");
+            }
+            targetLang = val;
+            continue;
+        }
+
+        if (arg === "--title" || arg === "-t") {
+            const val = argv[++i];
+            if (!val || !val.trim()) {
+                throw new Error(`Brak wartości dla ${arg}`);
+            }
+            titleHint = val.trim();
+            continue;
+        }
+
+        if (arg.startsWith("--title=")) {
+            const val = arg.slice("--title=".length).trim();
+            if (!val) {
+                throw new Error("Brak wartości dla --title");
+            }
+            titleHint = val;
+            continue;
+        }
+
+        files.push(arg);
+    }
+
+    return { files, startNumber, targetLang, titleHint, autoYes };
+}
+
+function detectSourceLanguageFromFilename(filePath: string): {
+    code?: string;
+    label: string;
+} {
+    const base = path.basename(filePath);
+    const match = base.match(/\.([a-z]{2,3})\.srt$/i);
+    if (!match) {
+        return { label: "wykrywany automatycznie z treści" };
+    }
+
+    const code = match[1].toLowerCase();
+    const mappedName = LANG_CODE_NAMES[code];
+    if (mappedName) {
+        return { code, label: `${mappedName} (${code})` };
+    }
+    return { code, label: `kod '${code}' (z nazwy pliku)` };
 }
 
 function sleep(ms: number): Promise<void> {
@@ -334,10 +451,11 @@ async function editKeywordsInteractive(
 }
 
 async function promptTranslationConfig(
-    rl: readline.Interface,
+    rl: readline.Interface | null,
     ai: GoogleGenAI,
     activeModels: string[],
-    sampleFile: string
+    sampleFile: string,
+    cliOptions: CliOptions
 ): Promise<{
     title: string;
     keywords: string[];
@@ -346,7 +464,10 @@ async function promptTranslationConfig(
 }> {
     console.log("\n--- Konfiguracja tłumaczenia ---");
 
-    let overrideTitle: string | undefined;
+    const detectedSource = detectSourceLanguageFromFilename(sampleFile);
+    console.log(`Wykryty język źródłowy: ${detectedSource.label}`);
+
+    let overrideTitle: string | undefined = cliOptions.titleHint;
     let title = "";
     let keywords: string[] = [];
 
@@ -374,6 +495,10 @@ async function promptTranslationConfig(
         );
         console.log(`Pomijane frazy napisowe: ${SKIP_PHRASES.join(", ")}`);
 
+        if (cliOptions.autoYes || !rl) {
+            break;
+        }
+
         const decision = (
             await askQuestion(
                 rl,
@@ -387,30 +512,37 @@ async function promptTranslationConfig(
         overrideTitle = decision;
     }
 
-    keywords = await editKeywordsInteractive(rl, keywords);
+    if (!cliOptions.autoYes && rl) {
+        keywords = await editKeywordsInteractive(rl, keywords);
+    }
 
-    const targetLangAnswer = (
-        await askQuestion(
-            rl,
-            `\nNa jaki język tłumaczymy napisy? [${DEFAULT_TARGET_LANG}]: `
-        )
-    ).trim();
-    const targetLang = targetLangAnswer || DEFAULT_TARGET_LANG;
+    let targetLang = cliOptions.targetLang ?? DEFAULT_TARGET_LANG;
+    if (cliOptions.targetLang === undefined && !cliOptions.autoYes && rl) {
+        const targetLangAnswer = (
+            await askQuestion(
+                rl,
+                `\nNa jaki język tłumaczymy napisy? [${DEFAULT_TARGET_LANG}]: `
+            )
+        ).trim();
+        targetLang = targetLangAnswer || DEFAULT_TARGET_LANG;
+    }
 
-    const startAnswer = (
-        await askQuestion(
-            rl,
-            "Od którego numeru napisu (bloku SRT) tłumaczymy plik? [Enter = od początku (0)]: "
-        )
-    ).trim();
+    let startNumber = cliOptions.startNumber ?? 0;
+    if (cliOptions.startNumber === undefined && !cliOptions.autoYes && rl) {
+        const startAnswer = (
+            await askQuestion(
+                rl,
+                "Od którego numeru napisu (bloku SRT) tłumaczymy plik? [Enter = od początku (0)]: "
+            )
+        ).trim();
 
-    let startNumber = 0;
-    if (startAnswer) {
-        const parsedNum = Number.parseInt(startAnswer, 10);
-        if (!Number.isNaN(parsedNum) && parsedNum >= 0) {
-            startNumber = parsedNum;
-        } else {
-            console.log("Nieprawidłowy numer – rozpoczynam od początku (0).");
+        if (startAnswer) {
+            const parsedNum = Number.parseInt(startAnswer, 10);
+            if (!Number.isNaN(parsedNum) && parsedNum >= 0) {
+                startNumber = parsedNum;
+            } else {
+                console.log("Nieprawidłowy numer – rozpoczynam od początku (0).");
+            }
         }
     }
 
@@ -420,9 +552,11 @@ async function promptTranslationConfig(
 function buildSystemInstruction(
     title: string,
     keywords: string[],
+    sourceLang: string,
     targetLang: string
 ): string {
     const cleanTitle = title.trim() || "nieokreślony tytuł";
+    const cleanSource = sourceLang.trim() || "wykrywany automatycznie";
     const cleanTarget = targetLang.trim() || DEFAULT_TARGET_LANG;
     const cleanKeywords = keywords.map((k) => k.trim()).filter(Boolean);
     const formattedNouns =
@@ -431,6 +565,7 @@ function buildSystemInstruction(
     return TRANSLATE_PROMPT_TEMPLATE
         .replace(/\{title\}/g, cleanTitle)
         .replace("{proper_nouns}", formattedNouns)
+        .replace(/\{source_lang\}/g, cleanSource)
         .replace(/\{target_lang\}/g, cleanTarget);
 }
 
@@ -643,7 +778,7 @@ async function callGeminiBatch(
                 status === 429 || status === 503 ? 4 : Math.min(30, 5 * attempt);
             const errMsg = err instanceof Error ? err.message : String(err);
             console.log(
-                `\n[${model} Błąd paczki próba ${attempt}/${maxAttempts}] (${errMsg}) -> pauza ${waitSec}s`
+                `\n[${model} Błąd paczki próba ${attempt}/${maxAttempts}] (${errMsg}) -> przełączam/pauza ${waitSec}s`
             );
             modelIdx++;
             await sleep(waitSec * 1000);
@@ -682,9 +817,12 @@ function buildOutputPath(inputPath: string, targetLang: string): string {
         suffix = `.${lowerLang}.srt`;
     }
 
-    return inputPath.endsWith(".srt")
-        ? inputPath.slice(0, -4) + suffix
-        : inputPath + suffix;
+    // Jeśli nazwa kończy się na np. .en.srt (2-3 litery przed .srt), usuwamy ten kod języka źródłowego
+    const baseWithoutSrt = inputPath.endsWith(".srt")
+        ? inputPath.slice(0, -4).replace(/\.[a-z]{2,3}$/i, "")
+        : inputPath.replace(/\.[a-z]{2,3}$/i, "");
+
+    return `${baseWithoutSrt}${suffix}`;
 }
 
 function writeSrtFile(outputPath: string, bodyBlocks: string[]): void {
@@ -832,7 +970,7 @@ function findSrtFilesInCwd(): string[] {
             (e) =>
                 e.isFile() &&
                 e.name.toLowerCase().endsWith(".srt") &&
-                !/\.[a-z]{2,3}\.srt$/i.test(e.name) &&
+                !e.name.toLowerCase().endsWith(".pl.srt") &&
                 !e.name.toLowerCase().endsWith(".translated.srt")
         )
         .map((e) => e.name)
@@ -845,8 +983,9 @@ async function main(): Promise<void> {
         process.exit(1);
     }
 
+    const cliOptions = parseCliArgs(process.argv.slice(2));
     const files =
-        process.argv.length > 2 ? process.argv.slice(2) : findSrtFilesInCwd();
+        cliOptions.files.length > 0 ? cliOptions.files : findSrtFilesInCwd();
 
     if (files.length === 0) {
         console.log("Brak plików .srt do przetłumaczenia.");
@@ -863,7 +1002,11 @@ async function main(): Promise<void> {
         process.exit(1);
     }
 
-    const rl = createPromptInterface();
+    const needInteractive =
+        !cliOptions.autoYes &&
+        (cliOptions.targetLang === undefined || cliOptions.startNumber === undefined || true);
+
+    const rl = needInteractive ? createPromptInterface() : null;
     let config: {
         title: string;
         keywords: string[];
@@ -872,19 +1015,27 @@ async function main(): Promise<void> {
     };
 
     try {
-        config = await promptTranslationConfig(rl, ai, activeModels, files[0]);
+        config = await promptTranslationConfig(
+            rl,
+            ai,
+            activeModels,
+            files[0],
+            cliOptions
+        );
     } finally {
-        rl.close();
+        rl?.close();
     }
-
-    const systemInstruction = buildSystemInstruction(
-        config.title,
-        config.keywords,
-        config.targetLang
-    );
 
     for (let i = 0; i < files.length; i++) {
         const fileStart = i === 0 ? config.startNumber : 0;
+        const fileSourceLang = detectSourceLanguageFromFilename(files[i]).label;
+        const systemInstruction = buildSystemInstruction(
+            config.title,
+            config.keywords,
+            fileSourceLang,
+            config.targetLang
+        );
+
         await translateSrt(
             ai,
             systemInstruction,
