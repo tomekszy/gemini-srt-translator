@@ -1,6 +1,6 @@
-# SRT Subtitle Translator (Gemini API)
+# SRT Subtitle Translator (Gemini API — TypeScript / Node.js)
 
-Uniwersalne narzędzie CLI do automatycznego tłumaczenia napisów filmowych w formacie .srt przy użyciu modeli Google Gemini. Program sam rozpoznaje tytuł produkcji z nazwy pliku .srt, weryfikuje jego istnienie, generuje listę słów kluczowych do zachowania, pozwala wznawiać tłumaczenie od dowolnego numeru bloku oraz dopisuje informację o projekcie na początku i końcu pliku wynikowego.
+Uniwersalne narzędzie CLI w TypeScript / Node.js do automatycznego tłumaczenia napisów filmowych w formacie .srt przy użyciu modeli Google Gemini. Program sam rozpoznaje tytuł produkcji z nazwy pliku .srt, weryfikuje jego istnienie, generuje listę słów kluczowych do zachowania, pozwala wznawiać tłumaczenie od dowolnego numeru bloku oraz dopisuje informację o projekcie na początku i końcu pliku wynikowego.
 
 Repozytorium projektu: https://github.com/tomekszy/gemini-srt-translator
 
@@ -8,29 +8,30 @@ Repozytorium projektu: https://github.com/tomekszy/gemini-srt-translator
 
 ## Struktura projektu
 
-- run_translate.sh — skrypt uruchomieniowy Bash, który tworzy lub odbudowuje środowisko wirtualne Pythona (.venv), instaluje bibliotekę google-genai, kopiuje GEMINI_API_KEY do .venv/.env i uruchamia program.
-- translate_srt_gemini.py — główny skrypt wykrywający modele Gemini, identyfikujący tytuł i słowa kluczowe, tłumaczący napisy paczkami i zapisujący pliki wyjściowe.
+- run_translate.sh — skrypt uruchomieniowy Bash ładujący zmienne z .env, instalujący zależności Node.js (w razie potrzeby), kompilujący TypeScript i uruchamiający dist/index.js.
+- src/index.ts — główny kod źródłowy w TypeScript.
+- dist/index.js — skompilowany kod JavaScript uruchamiany przez Node.js.
+- package.json oraz tsconfig.json — konfiguracja projektu Node.js oraz kompilatora TypeScript.
 - .env — plik przechowujący zmienną środowiskową GEMINI_API_KEY.
 
 ---
 
 ## Jak działa program (krok po kroku)
 
-1. **Inicjalizacja środowiska (run_translate.sh)**:
-  - Sprawdza, czy katalog .venv istnieje i ma poprawne ścieżki (w razie przeniesienia katalogu projektu automatycznie odbudowuje .venv).
-  - Instaluje pakiet google-genai wewnątrz .venv, jeśli nie jest jeszcze dostępny.
-  - Pobiera GEMINI_API_KEY z głównego pliku .env, zapisuje go w .venv/.env i eksportuje do środowiska procesu.
-2. **Automatyczne wykrywanie modeli (discover_usable_models)**:
+1. **Przygotowanie środowiska i kompilacja (run_translate.sh)**:
+  - Wczytuje GEMINI_API_KEY z pliku .env.
+  - Instaluje zależności z package.json, jeśli brakuje node_modules.
+  - Kompiluje src/index.ts do dist/index.js (jeśli plik źródłowy jest nowszy niż wynik kompilacji).
+2. **Automatyczne wykrywanie modeli (discoverUsableModels)**:
   - Na starcie program odpytuje API Gemini o wszystkie modele dostępne dla podanego klucza.
   - Odrzuca modele nieobsługujące generowania tekstu (np. embedding, imagen, veo, tts, transcribe, audio, computer-use, robotics, deep-research).
   - Sortuje pozostałe modele według przydatności do tłumaczeń wsadowych (priorytet dla modeli flash-lite, następnie flash, na końcu pro) i używa całej wykrytej listy.
 3. **Rozpoznawanie tytułu i słów kluczowych przez Gemini**:
   - Program wysyła nazwę pliku .srt do Gemini, aby odgadnąć tytuł produkcji, ocenić, czy taki tytuł istnieje, oraz wygenerować listę słów kluczowych (nazw własnych) do zachowania.
-  - Użytkownik widzi rozpoznany tytuł, informację o istnieniu tytułu, wygenerowane słowa kluczowe oraz listę pomijanych fraz napisowych.
   - Wpisanie nowego tytułu wysyła ponowne zapytanie do Gemini z poprawionym tytułem i odświeżoną listą słów kluczowych; wciśnięcie Enter zatwierdza tytuł.
 4. **Edycja słów kluczowych, język docelowy i blok startowy**:
   - Słowa kluczowe można zatwierdzić klawiszem Enter, dodać (+nazwa lub nazwa) albo usunąć (-nazwa), dopasowanie w tłumaczeniu jest niewrażliwe na wielkość liter (case-insensitive).
-  - Program pyta wyłącznie o język docelowy (domyślnie polski); język źródłowy jest rozpoznawany automatycznie przez model.
+  - Program pyta o język docelowy (domyślnie polski); język źródłowy jest rozpoznawany automatycznie przez model.
   - Następnie program pyta, od którego numeru bloku SRT rozpocząć tłumaczenie (Enter oznacza start od początku pliku).
 5. **Wznawianie od wskazanego numeru napisu**:
   - Jeśli podano numer początkowy (np. 422), program wczytuje istniejący plik wyjściowy, zachowuje bez zmian wszystkie bloki przed numerem 422 (1..421) i tłumaczy od bloku #422 do końca pliku.
@@ -46,7 +47,7 @@ Repozytorium projektu: https://github.com/tomekszy/gemini-srt-translator
 
 ## Wymagania
 
-- System Linux / macOS z zainstalowanym python3 (z modułem venv) oraz bash.
+- Node.js oraz npm (oraz bash).
 - Klucz API Google Gemini w pliku .env:
 
   GEMINI_API_KEY=twoj_klucz_api_z_google_ai_studio
